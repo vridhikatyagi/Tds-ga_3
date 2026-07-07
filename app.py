@@ -8,18 +8,19 @@ import os
 # 1. Initialize FastAPI Application
 app = FastAPI(title="IITM Fixed Schema Invoice Extraction API")
 
-# 2. Enable CORS (Required for the external Cloudflare Worker grader)
+# 2. Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows requests from any origin
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all HTTP methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# 3. Define Request and Response Schemas
+# 3. Flexible Request Schema to handle both variations
 class InvoiceRequest(BaseModel):
-    invoice_text: str
+    invoice_text: Optional[str] = None
+    text: Optional[str] = None  # Added fallback for the grader payload
 
 class InvoiceResponse(BaseModel):
     invoice_no: Optional[str] = None
@@ -29,28 +30,23 @@ class InvoiceResponse(BaseModel):
     tax: Optional[float] = None
     currency: Optional[str] = None
 
-# Helper function to clean and parse numbers
 def parse_float(text: str) -> Optional[float]:
     if not text:
         return None
     try:
-        # Remove currency symbols, spaces, and commas (handles formats like 1,40,000.00)
         cleaned = re.sub(r'[^\d.]', '', text)
         return float(cleaned) if cleaned else None
     except ValueError:
         return None
 
-# Helper function to normalize various date formats to YYYY-MM-DD
 def normalize_date(date_str: str) -> Optional[str]:
     if not date_str:
         return None
     date_str = date_str.strip()
     
-    # Check if already in YYYY-MM-DD format
     if re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
         return date_str
         
-    # Handle human-readable formats like "15 March 2026"
     months = {
         "january": "01", "jan": "01", "february": "02", "feb": "02",
         "march": "03", "mar": "03", "april": "04", "apr": "04",
@@ -62,7 +58,6 @@ def normalize_date(date_str: str) -> Optional[str]:
     
     parts = re.split(r'[\s,/-]+', date_str)
     if len(parts) >= 3:
-        # Assuming format: DD Month YYYY or Month DD YYYY
         day, month, year = None, None, None
         for part in parts:
             part_lower = part.lower()
@@ -75,37 +70,40 @@ def normalize_date(date_str: str) -> Optional[str]:
                     if not day:
                         day = part.zfill(2)
                     else:
-                        year = part  # fallback for YY
+                        year = part
         if year and month and day:
             return f"{year}-{month}-{day}"
             
     return None
 
-# 4. Define the POST Endpoint matching the specification exactly
+# 4. POST Endpoint
 @app.post("/extract", response_model=InvoiceResponse)
 async def extract_invoice(payload: InvoiceRequest):
     try:
-        text = payload.invoice_text
+        # Resolve whichever field the grader provided
+        text = payload.invoice_text or payload.text
+        if not text:
+            raise HTTPException(status_code=422, detail="Invoice text content is required.")
+            
         lines = text.split('\n')
         
         # Heuristics & Regex Mapping
         invoice_no = None
-        inv_match = re.search(r'(?i)(?:invoice\s*no|ref|reference|inv\s*#)[:\s\-]+([A-Za-z0-9\/]+)', text)
+        inv_match = re.search(r'(?i)(?:invoice\s*no|ref|reference|inv\s*#|reference\s*no)[:\s\-]+([A-Za-z0-9\/_\-]+)', text)
         if inv_match:
             invoice_no = inv_match.group(1)
 
         date_val = None
-        date_match = re.search(r'(?i)(?:date|issued)[:\s\-]+([0-9a-zA-Z\s,./-]+)', text)
+        date_match = re.search(r'(?i)(?:date|issued|invoice\s*date)[:\s\-]+([0-9a-zA-Z\s,./-]+)', text)
         if date_match:
             date_val = normalize_date(date_match.group(1))
 
         vendor = None
-        vendor_match = re.search(r'(?i)vendor[:\s\-]+([^\n]+)', text)
+        vendor_match = re.search(r'(?i)(?:vendor|issued\s*by)[:\s\-]+([^\n]+)', text)
         if vendor_match:
             vendor = vendor_match.group(1).strip()
         else:
-            # Fallback: Check if the first line contains a company name indication
-            if lines and ("solutions" in lines[0].lower() or "solutions" in lines[0].lower() or "pvt" in lines[0].lower() or "ltd" in lines[0].lower()):
+            if lines and any(k in lines[0].lower() for k in ["solutions", "pvt", "ltd", "logistics", "corp"]):
                 vendor = lines[0].split('—')[0].strip()
 
         amount = None
@@ -118,7 +116,7 @@ async def extract_invoice(payload: InvoiceRequest):
         if tax_match:
             tax = parse_float(tax_match.group(1))
 
-        currency = "INR" # Default fallback
+        currency = "INR"
         curr_match = re.search(r'(?i)currency[:\s\-]+([A-Z]{3})', text)
         if curr_match:
             currency = curr_match.group(1).upper()
@@ -139,6 +137,5 @@ async def extract_invoice(payload: InvoiceRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    # Dynamically bind to the port assigned by Render, or fallback to 8000 for local execution
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
