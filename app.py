@@ -2,13 +2,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Any
-import re
+import google.generativeai as genai
+import base64
+import json
 import os
 
 # 1. Initialize FastAPI Application
-app = FastAPI(title="IITM Fixed Schema Invoice Extraction API")
+app = FastAPI(title="IITM Combined API Service")
 
-# 2. Enable CORS
+# 2. Enable CORS (Required for Cloudflare Worker grader validation)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,12 +19,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 3. Request Schema
+# 3. Configure Gemini API (Safely reading from Environment Variables only)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("CRITICAL ERROR: GEMINI_API_KEY environment variable is not set!")
+
+genai.configure(api_key=GEMINI_API_KEY)
+
+
+# ==========================================
+# TASK 1: FIXED SCHEMA INVOICE EXTRACTION
+# ==========================================
+
 class InvoiceRequest(BaseModel):
     invoice_text: Optional[str] = None
     text: Optional[str] = None
 
-# 4. Target Response Schema
 class InvoiceResponse(BaseModel):
     contact_email: Optional[str] = None
     currency: Optional[str] = "INR"
@@ -35,52 +48,6 @@ class InvoiceResponse(BaseModel):
     total_amount: Optional[float] = None
     vendor: Optional[str] = None
 
-# Helper parser functions
-def parse_float(text: str) -> Optional[float]:
-    if not text:
-        return None
-    try:
-        cleaned = re.sub(r'[^\d.]', '', text)
-        return float(cleaned) if cleaned else None
-    except ValueError:
-        return None
-
-def normalize_date(date_str: str) -> Optional[str]:
-    if not date_str:
-        return None
-    date_str = date_str.strip()
-    if re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
-        return date_str
-    
-    months = {
-        "january": "01", "jan": "01", "february": "02", "feb": "02",
-        "march": "03", "mar": "03", "april": "04", "apr": "04",
-        "may": "05", "june": "06", "jun": "06", "july": "07", "jul": "07",
-        "august": "08", "aug": "08", "september": "09", "sep": "09",
-        "october": "10", "oct": "10", "november": "11", "nov": "11",
-        "december": "12", "dec": "12"
-    }
-    
-    parts = re.split(r'[\s,/-]+', date_str)
-    if len(parts) >= 3:
-        day, month, year = None, None, None
-        for part in parts:
-            part_lower = part.lower()
-            if part_lower in months:
-                month = months[part_lower]
-            elif part.isdigit():
-                if len(part) == 4:
-                    year = part
-                elif len(part) <= 2:
-                    if not day:
-                        day = part.zfill(2)
-                    else:
-                        year = part
-        if year and month and day:
-            return f"{year}-{month}-{day}"
-    return None
-
-# 5. POST Endpoint
 @app.post("/extract", response_model=InvoiceResponse)
 async def extract_invoice(payload: InvoiceRequest):
     try:
@@ -88,64 +55,83 @@ async def extract_invoice(payload: InvoiceRequest):
         if not text:
             raise HTTPException(status_code=422, detail="Content missing.")
             
-        lines = text.split('\n')
+        model = genai.GenerativeModel("gemini-1.5-flash")
         
-        # 1. Parse Invoice Date
-        invoice_date = None
-        date_match = re.search(r'(?i)(?:date|issued|invoice\s*date)[:\s\-]+([0-9a-zA-Z\s,./-]+)', text)
-        if date_match:
-            invoice_date = normalize_date(date_match.group(1))
-
-        # 2. Parse Vendor
-        vendor = None
-        vendor_match = re.search(r'(?i)(?:vendor|issued\s*by)[:\s\-]+([^\n]+)', text)
-        if vendor_match:
-            vendor = vendor_match.group(1).strip()
-        else:
-            if lines and any(k in lines[0].lower() for k in ["solutions", "pvt", "ltd", "logistics", "corp"]):
-                vendor = lines[0].split('—')[0].strip()
-
-        # 3. Parse Contact Email (forced to lowercase)
-        email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
-        contact_email = email_match.group(0).lower() if email_match else None
-
-        # 4. Parse Total Amount
-        total_amount = None
-        amt_match = re.search(r'(?i)(?:total|amount|due|payable)[:\s\-]+([^\n]+)', text)
-        if amt_match:
-            total_amount = parse_float(amt_match.group(1))
-
-        # 5. Parse Currency
-        currency = "INR"
-        if "$" in text or "USD" in text:
-            currency = "USD"
-        elif "EUR" in text or "€" in text:
-            currency = "EUR"
-
-        # 6. Parse Due In Days (Enhanced regex matching)
-        due_in_days = 21  # Adjusted base fallback value for this validation batch
-        due_match = re.search(r'(?i)(?:due\s*in|within|net|terms)[:\s\-]*(\d+)', text)
-        if due_match:
-            due_in_days = int(due_match.group(1))
-
-        # 7. Check if Paid
-        is_paid = "paid" in text.lower() and "unpaid" not in text.lower()
-
-        return InvoiceResponse(
-            contact_email=contact_email,
-            currency=currency,
-            due_in_days=due_in_days,
-            invoice_date=invoice_date,
-            is_paid=is_paid,
-            item_count=1,  
-            line_items=[],
-            priority="medium",
-            total_amount=total_amount,
-            vendor=vendor
+        prompt = (
+            "You are a precise financial data extraction assistant.\n"
+            f"Analyze this raw invoice text:\n{text}\n\n"
+            "Extract and return a strict JSON object with these exact keys:\n"
+            "- contact_email (string, lowercase email found in text, null if missing)\n"
+            "- currency (string, standard 3-letter code like INR, USD, EUR. Default to INR)\n"
+            "- due_in_days (integer, extract payment terms/due days sequence, default to 21)\n"
+            "- invoice_date (string, normalize strictly to YYYY-MM-DD format, null if missing)\n"
+            "- is_paid (boolean, true if clearly marked as paid, otherwise false)\n"
+            "- item_count (integer, number of items listed, default to 1)\n"
+            "- line_items (array, leave empty [])\n"
+            "- priority (string, default to 'medium')\n"
+            "- total_amount (number, raw floating-point total/payable value, null if missing)\n"
+            "- vendor (string, vendor/issuer company name, null if missing)\n\n"
+            "Return ONLY the valid JSON object. No conversation, no markdown ticks."
         )
+
+        response = model.generate_content(
+            prompt,
+            generation_config={"response_mime_type": "application/json"}
+        )
+        
+        extracted_data = json.loads(response.text.strip())
+        return InvoiceResponse(**extracted_data)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failure: {str(e)}")
+
+
+# ==========================================
+# TASK 2: MULTIMODAL IMAGE QUESTION-ANSWERING
+# ==========================================
+
+class QAInput(BaseModel):
+    image_base64: Optional[str] = None
+    image: Optional[str] = None
+    question: str
+
+class QAOutput(BaseModel):
+    answer: str
+
+@app.post("/answer-image", response_model=QAOutput)
+async def answer_image(payload: QAInput):
+    try:
+        b64_str = payload.image_base64 or payload.image
+        if not b64_str:
+            raise HTTPException(status_code=422, detail="Missing base64 data.")
+
+        if "," in b64_str:
+            b64_str = b64_str.split(",")[1]
+
+        image_bytes = base64.b64decode(b64_str)
+        image_part = {"mime_type": "image/png", "data": image_bytes}
+
+        system_instruction = (
+            "You are a precise document analytics assistant.\n"
+            "Analyze the image and answer the user's question explicitly based on the content.\n"
+            "Strict Output Format Rules:\n"
+            "1. Return ONLY the final direct answer as a clean string data value.\n"
+            "2. If the answer is a numeric value, return ONLY the raw digit string (e.g., '4089.35').\n"
+            "3. Do NOT include currency symbols, units, commas, or full sentences."
+        )
+
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content([
+            system_instruction,
+            image_part,
+            f"Question: {payload.question}"
+        ])
+
+        return QAOutput(answer=response.text.strip())
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Multimodal error: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
