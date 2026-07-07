@@ -55,7 +55,8 @@ async def extract_invoice(payload: InvoiceRequest):
         if not text:
             raise HTTPException(status_code=422, detail="Content missing.")
             
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        # Updated to explicitly use the models/ prefix to solve the 404 issue
+        model = genai.GenerativeModel("models/gemini-1.5-flash")
         
         prompt = (
             "You are a precise financial data extraction assistant.\n"
@@ -120,7 +121,8 @@ async def answer_image(payload: QAInput):
             "3. Do NOT include currency symbols, units, commas, or full sentences."
         )
 
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        # Updated to explicitly use the models/ prefix to solve the 404 issue
+        model = genai.GenerativeModel("models/gemini-1.5-flash")
         response = model.generate_content([
             system_instruction,
             image_part,
@@ -130,7 +132,7 @@ async def answer_image(payload: QAInput):
         return QAOutput(answer=response.text.strip())
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Multimodal error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Extraction failure: {str(e)}")
 
 
 if __name__ == "__main__":
