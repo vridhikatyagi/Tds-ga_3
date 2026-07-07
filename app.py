@@ -22,7 +22,7 @@ class InvoiceRequest(BaseModel):
     invoice_text: Optional[str] = None
     text: Optional[str] = None
 
-# 4. Corrected Target Response Schema Matching Expected Keys Exactly
+# 4. Target Response Schema
 class InvoiceResponse(BaseModel):
     contact_email: Optional[str] = None
     currency: Optional[str] = "INR"
@@ -105,9 +105,9 @@ async def extract_invoice(payload: InvoiceRequest):
             if lines and any(k in lines[0].lower() for k in ["solutions", "pvt", "ltd", "logistics", "corp"]):
                 vendor = lines[0].split('—')[0].strip()
 
-        # 3. Parse Contact Email
+        # 3. Parse Contact Email (Forced to lowercase here)
         email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
-        contact_email = email_match.group(0) if email_match else None
+        contact_email = email_match.group(0).lower() if email_match else None
 
         # 4. Parse Total Amount
         total_amount = None
@@ -123,7 +123,7 @@ async def extract_invoice(payload: InvoiceRequest):
             currency = "EUR"
 
         # 6. Parse Due In Days
-        due_in_days = 30  # Default baseline fallback
+        due_in_days = 30  
         due_match = re.search(r'(?i)(?:due\s*in|within)[:\s\-]*(\d+)\s*days', text)
         if due_match:
             due_in_days = int(due_match.group(1))
@@ -137,7 +137,7 @@ async def extract_invoice(payload: InvoiceRequest):
             due_in_days=due_in_days,
             invoice_date=invoice_date,
             is_paid=is_paid,
-            item_count=1,  # baseline standard fallback
+            item_count=1,  
             line_items=[],
             priority="medium",
             total_amount=total_amount,
